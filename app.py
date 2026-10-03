@@ -8,18 +8,26 @@ from pathlib import Path
 
 from dataset_compressor import scan_datasets, process_dataset_folder
 from dataset_decompressor import scan_compressed_datasets, process_decompress_folder
+from cloud_sync import (
+    scan_and_build_index,
+    save_index_csv,
+    load_index_csv,
+    process_cloud_sync,
+    INDEX_FILENAME
+)
 
 class DatasetCompressorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Image Dataset Compressor & Decompressor")
-        self.root.geometry("820x680")
-        self.root.minsize(720, 580)
+        self.root.title("Image Dataset Compressor & Cloud Sync Tool")
+        self.root.geometry("860x720")
+        self.root.minsize(760, 620)
 
         # システム情報
         self.max_cpus = os.cpu_count() or 4
         self.is_running = False
         self.log_queue = queue.Queue()
+        self.cloud_cancel_event = threading.Event()
 
         # テーマとスタイルの初期化
         self.setup_styles()
@@ -73,12 +81,12 @@ class DatasetCompressorApp:
         header_frame = ttk.Frame(self.root, style="Header.TFrame", padding=(15, 12))
         header_frame.pack(fill=tk.X)
         
-        title_label = ttk.Label(header_frame, text="📦 Image Dataset Compressor & Decompressor", style="HeaderTitle.TLabel")
+        title_label = ttk.Label(header_frame, text="📦 Image Dataset & Cloud Sync Management Tool", style="HeaderTitle.TLabel")
         title_label.pack(anchor=tk.W)
         
         sub_label = ttk.Label(
             header_frame, 
-            text="データセットの高速並列圧縮 (npz化) および 完全元解像度復元 (解凍) ツール", 
+            text="データセット高速並列圧縮 / 解凍・復元 & クラウド安定転送・同期システム", 
             style="HeaderSub.TLabel"
         )
         sub_label.pack(anchor=tk.W, pady=(2, 0))
@@ -87,7 +95,7 @@ class DatasetCompressorApp:
         main_frame = ttk.Frame(self.root, padding=15)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 2. タブコントロール (圧縮 / 解凍)
+        # 2. タブコントロール (圧縮 / 解凍 / クラウド転送)
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=False, pady=(0, 10))
 
@@ -99,8 +107,11 @@ class DatasetCompressorApp:
         self.tab_decompress = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.tab_decompress, text=" 🔓 圧縮データセット解凍 (Unpack) ")
 
+        # タブ3: クラウド転送・同期
+        self.tab_cloud = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.tab_cloud, text=" ☁️ クラウド安定転送・同期 (Sync) ")
+
         # --- 圧縮タブのレイアウト ---
-        # フォルダ選択
         comp_folder_frame = ttk.LabelFrame(self.tab_compress, text=" 対象フォルダの指定 ", padding=8)
         comp_folder_frame.pack(fill=tk.X, pady=(0, 8))
         
@@ -108,7 +119,6 @@ class DatasetCompressorApp:
         ttk.Entry(comp_folder_frame, textvariable=self.comp_path_var, font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         ttk.Button(comp_folder_frame, text="参照...", command=lambda: self.browse_folder(self.comp_path_var)).pack(side=tk.RIGHT)
 
-        # パラメータ
         comp_param_frame = ttk.Frame(self.tab_compress)
         comp_param_frame.pack(fill=tk.X, pady=(0, 8))
 
@@ -120,7 +130,6 @@ class DatasetCompressorApp:
         self.min_img_var = tk.IntVar(value=20)
         ttk.Spinbox(comp_param_frame, from_=1, to=1000, textvariable=self.min_img_var, width=6).pack(side=tk.LEFT)
 
-        # ボタン
         comp_btn_frame = ttk.Frame(self.tab_compress)
         comp_btn_frame.pack(fill=tk.X)
         self.scan_comp_btn = ttk.Button(comp_btn_frame, text="🔍 対象スキャン", command=self.start_scan_compress)
@@ -149,6 +158,37 @@ class DatasetCompressorApp:
         self.scan_decomp_btn.pack(side=tk.LEFT, padx=(0, 10))
         self.start_decomp_btn = ttk.Button(decomp_btn_frame, text="🔓 解凍・復元処理を開始", style="Warn.TButton", command=self.start_processing_decompress)
         self.start_decomp_btn.pack(side=tk.LEFT)
+
+        # --- クラウド転送・同期タブのレイアウト ---
+        cloud_src_frame = ttk.LabelFrame(self.tab_cloud, text=" 処理対象フォルダ (コピー元) ", padding=6)
+        cloud_src_frame.pack(fill=tk.X, pady=(0, 4))
+        self.cloud_src_var = tk.StringVar()
+        ttk.Entry(cloud_src_frame, textvariable=self.cloud_src_var, font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Button(cloud_src_frame, text="参照...", command=lambda: self.browse_folder(self.cloud_src_var)).pack(side=tk.RIGHT)
+
+        cloud_dest_frame = ttk.LabelFrame(self.tab_cloud, text=" コピー先フォルダ (クラウド/ネットワーク) ", padding=6)
+        cloud_dest_frame.pack(fill=tk.X, pady=(0, 4))
+        self.cloud_dest_var = tk.StringVar()
+        ttk.Entry(cloud_dest_frame, textvariable=self.cloud_dest_var, font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Button(cloud_dest_frame, text="参照...", command=lambda: self.browse_folder(self.cloud_dest_var)).pack(side=tk.RIGHT)
+
+        cloud_idx_frame = ttk.LabelFrame(self.tab_cloud, text=" インデックスファイル (途中再開時に指定 folder_index.csv) ", padding=6)
+        cloud_idx_frame.pack(fill=tk.X, pady=(0, 4))
+        self.cloud_idx_var = tk.StringVar()
+        ttk.Entry(cloud_idx_frame, textvariable=self.cloud_idx_var, font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Button(cloud_idx_frame, text="参照...", command=lambda: self.browse_file(self.cloud_idx_var, [("CSV Files", "*.csv"), ("All Files", "*.*")])).pack(side=tk.RIGHT)
+
+        cloud_btn_frame = ttk.Frame(self.tab_cloud)
+        cloud_btn_frame.pack(fill=tk.X, pady=(4, 0))
+
+        self.scan_cloud_btn = ttk.Button(cloud_btn_frame, text="📝 構造スキャン & インデックス作成", command=self.start_scan_cloud)
+        self.scan_cloud_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.start_cloud_btn = ttk.Button(cloud_btn_frame, text="☁️ クラウド安定転送を開始", style="Primary.TButton", command=self.start_processing_cloud)
+        self.start_cloud_btn.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.stop_cloud_btn = ttk.Button(cloud_btn_frame, text="⏹️ 中断", command=self.stop_cloud_sync, state=tk.DISABLED)
+        self.stop_cloud_btn.pack(side=tk.LEFT)
 
         # 3. 共有プログレスバー & ステータス
         self.progress_var = tk.DoubleVar()
@@ -189,6 +229,12 @@ class DatasetCompressorApp:
         if selected:
             target_var.set(selected)
             self.log(f"フォルダが指定されました: {selected}", "INFO")
+
+    def browse_file(self, target_var, filetypes):
+        selected = filedialog.askopenfilename(filetypes=filetypes)
+        if selected:
+            target_var.set(selected)
+            self.log(f"ファイルが指定されました: {selected}", "INFO")
 
     # --- 圧縮処理 ---
     def start_scan_compress(self):
@@ -342,6 +388,129 @@ class DatasetCompressorApp:
         self.log(f"全解凍・復元処理が完了しました！ (成功: {success_count}/{total_folders} フォルダ, 復元画像: {total_restored_images} 枚)", "SUCCESS")
         self.root.after(0, self._on_process_complete)
 
+    # --- クラウド転送・同期処理 ---
+    def start_scan_cloud(self):
+        src_path = self.cloud_src_var.get().strip()
+        if not src_path or not os.path.exists(src_path):
+            messagebox.showerror("エラー", "有効な処理対象(コピー元)フォルダパスを指定してください。")
+            return
+
+        self.scan_cloud_btn.config(state=tk.DISABLED)
+        self.status_label.config(text="フォルダ構造を解析してインデックスを作成中...")
+        threading.Thread(target=self._scan_cloud_thread, args=(src_path,), daemon=True).start()
+
+    def _scan_cloud_thread(self, src_path):
+        try:
+            self.log("===" * 15, "INFO")
+            self.log(f"フォルダ構造スキャン開始: {src_path}", "INFO")
+            entries = scan_and_build_index(src_path)
+            
+            index_file = Path(src_path) / INDEX_FILENAME
+            save_index_csv(index_file, entries)
+
+            folders_cnt = sum(1 for e in entries if e["タイプ"] == "フォルダー")
+            files_cnt = sum(1 for e in entries if e["タイプ"] == "ファイル")
+
+            self.log(f"スキャン完了! 全 {len(entries)} 項目 (フォルダ: {folders_cnt}, ファイル: {files_cnt})", "SUCCESS")
+            self.log(f"インデックス保存先: {index_file}", "SUCCESS")
+
+            self.root.after(0, lambda: self.cloud_idx_var.set(str(index_file)))
+            self.root.after(0, lambda: self._on_scan_complete(self.scan_cloud_btn, f"インデックス作成完了: {len(entries)} 項目"))
+        except Exception as e:
+            self.log(f"インデックス作成エラー: {e}", "ERROR")
+            self.root.after(0, lambda: self._on_scan_complete(self.scan_cloud_btn, "インデックス作成失敗"))
+
+    def start_processing_cloud(self):
+        if self.is_running:
+            return
+
+        src_path = self.cloud_src_var.get().strip()
+        dest_path = self.cloud_dest_var.get().strip()
+        idx_path = self.cloud_idx_var.get().strip()
+
+        if not src_path or not os.path.exists(src_path):
+            messagebox.showerror("エラー", "有効な処理対象(コピー元)フォルダを指定してください。")
+            return
+        if not dest_path:
+            messagebox.showerror("エラー", "コピー先フォルダを指定してください。")
+            return
+
+        confirm_msg = (
+            f"フォルダ転送・同期を開始します。\n\n"
+            f"・コピー元: {src_path}\n"
+            f"・コピー先: {dest_path}\n"
+        )
+        if idx_path and os.path.exists(idx_path):
+            confirm_msg += f"・使用インデックス (途中再開): {idx_path}\n"
+        else:
+            confirm_msg += f"・インデックス: 新規自動生成 (folder_index.csv)\n"
+
+        confirm_msg += "\n処理を開始してよろしいですか？"
+
+        if not messagebox.askyesno("クラウド転送開始の確認", confirm_msg):
+            return
+
+        self.is_running = True
+        self.cloud_cancel_event.clear()
+        self.set_buttons_state(tk.DISABLED)
+        self.stop_cloud_btn.config(state=tk.NORMAL)
+
+        threading.Thread(
+            target=self._process_cloud_thread,
+            args=(src_path, dest_path, idx_path if idx_path else None),
+            daemon=True
+        ).start()
+
+    def _cloud_progress_callback(self, data):
+        data_type = data.get("type")
+        if data_type == "info":
+            self.log(data.get("message"), "INFO")
+        elif data_type == "warning":
+            self.log(data.get("message"), "WARNING")
+        elif data_type == "error":
+            self.log(data.get("message"), "ERROR")
+        elif data_type == "start":
+            self.log(data.get("message"), "INFO")
+            self.root.after(0, lambda: self.status_label.config(text=data.get("message")))
+        elif data_type == "progress":
+            completed = data.get("completed", 0)
+            total = data.get("total", 1)
+            pct = (completed / total) * 100
+            msg = data.get("message", "")
+            self.root.after(0, lambda p=pct: self.progress_var.set(p))
+            self.root.after(0, lambda text=f"転送中 ({completed}/{total}): {data.get('rel_path')}": self.status_label.config(text=text))
+            self.log(msg, "SUCCESS" if "完了" in msg else "INFO")
+
+    def _process_cloud_thread(self, src_path, dest_path, idx_path):
+        self.log("===" * 15, "INFO")
+        self.log("クラウド安定転送・同期処理を開始します...", "INFO")
+
+        res = process_cloud_sync(
+            source_dir=src_path,
+            dest_dir=dest_path,
+            index_csv_path=idx_path,
+            progress_callback=self._cloud_progress_callback,
+            cancel_event=self.cloud_cancel_event
+        )
+
+        self.root.after(0, lambda: self.progress_var.set(100))
+        self.log("===" * 15, "SUCCESS" if res["status"] == "completed" else "WARNING")
+        self.log(
+            f"転送処理が終了しました！ [{res['status'].upper()}]\n"
+            f"・全項目: {res['total']} 件\n"
+            f"・完了(全件): {res['completed']} 件\n"
+            f"・新規コピー: {res['copied']} 件\n"
+            f"・同一内容スキップ: {res['skipped']} 件\n"
+            f"・エラー: {res['errors']} 件",
+            "SUCCESS" if res["errors"] == 0 else "WARNING"
+        )
+        self.root.after(0, self._on_process_complete)
+
+    def stop_cloud_sync(self):
+        if self.is_running:
+            self.cloud_cancel_event.set()
+            self.log("中断要求を受け付けました。現在の項目の書き込み完了後に安全に停止します...", "WARNING")
+
     # --- 共通ユーティリティ ---
     def _on_scan_complete(self, btn, status_msg):
         btn.config(state=tk.NORMAL)
@@ -352,6 +521,10 @@ class DatasetCompressorApp:
         self.start_comp_btn.config(state=state)
         self.scan_decomp_btn.config(state=state)
         self.start_decomp_btn.config(state=state)
+        self.scan_cloud_btn.config(state=state)
+        self.start_cloud_btn.config(state=state)
+        if state == tk.NORMAL:
+            self.stop_cloud_btn.config(state=tk.DISABLED)
 
     def _on_process_complete(self):
         self.is_running = False
