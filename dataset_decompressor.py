@@ -8,7 +8,8 @@ from PIL import Image
 def scan_compressed_datasets(root_dir):
     """
     指定されたルートディレクトリ以下を再帰的にスキャンし、
-    dataset.npz と images_index.csv が存在するフォルダのリストを返します。
+    images_index.csv および .npz ファイルが存在するフォルダのリストを返します。
+    (マルチコア圧縮ファイル・無圧縮パックファイルともに検出対象となります)
     """
     compressed_folders = []
     root_path = Path(root_dir)
@@ -18,7 +19,9 @@ def scan_compressed_datasets(root_dir):
 
     for dirpath, _, filenames in os.walk(root_path):
         folder = Path(dirpath)
-        if (folder / "dataset.npz").exists() and (folder / "images_index.csv").exists():
+        has_csv = (folder / "images_index.csv").exists()
+        has_npz = any(f.endswith(".npz") for f in filenames)
+        if has_csv and has_npz:
             compressed_folders.append(folder)
             
     return compressed_folders
@@ -65,17 +68,16 @@ def _decompress_image_worker(args):
 
 def process_decompress_folder(folder_path, num_workers=4, progress_callback=None):
     """
-    単一の圧縮データセットフォルダを解凍・復元します。
-    1. images_index.csv と dataset.npz の読み込み
+    単一の圧縮/パックデータセットフォルダを解凍・復元します。
+    1. images_index.csv の読み込みおよび該当 .npz ファイルの探索
     2. 元サイズへのクロップと画像保存を並列実行
-    3. images_index.csv と dataset.npz の削除
+    3. images_index.csv および関連 .npz ファイルの削除
     """
     folder_path = Path(folder_path)
-    npz_path = folder_path / "dataset.npz"
     csv_path = folder_path / "images_index.csv"
 
-    if not npz_path.exists() or not csv_path.exists():
-        return {'status': 'error', 'message': 'dataset.npz または images_index.csv が存在しません'}
+    if not csv_path.exists():
+        return {'status': 'error', 'message': 'images_index.csv が存在しません'}
 
     # CSV の読み込み
     index_records = []
@@ -83,11 +85,13 @@ def process_decompress_folder(folder_path, num_workers=4, progress_callback=None
         with open(csv_path, mode='r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
+                npz_file_name = row.get('npz_file') or "dataset.npz"
                 index_records.append({
                     'index': int(row['index']),
                     'filename': row['filename'],
                     'orig_w': int(row['original_width']),
-                    'orig_h': int(row['original_height'])
+                    'orig_h': int(row['original_height']),
+                    'npz_file': npz_file_name
                 })
     except Exception as e:
         return {'status': 'error', 'message': f'images_index.csv の読み込みに失敗しました: {e}'}
@@ -95,27 +99,33 @@ def process_decompress_folder(folder_path, num_workers=4, progress_callback=None
     if not index_records:
         return {'status': 'error', 'message': 'images_index.csv 内にレコードが存在しません'}
 
-    # npz の読み込み
-    try:
-        with np.load(npz_path) as data:
-            if 'images' not in data:
-                return {'status': 'error', 'message': 'npz 内に images キーが存在しません'}
-            images_array = data['images'] # shape: (N, max_h, max_w, C)
-    except Exception as e:
-        return {'status': 'error', 'message': f'dataset.npz の読み込みに失敗しました: {e}'}
+    # 参照されている npz ファイルのロード (キャッシュ化)
+    npz_cache = {}
+    npz_files_needed = set(r['npz_file'] for r in index_records)
 
-    if len(index_records) > len(images_array):
-        return {'status': 'error', 'message': 'csv のレコード数と npz 内の画像数が一致しません'}
+    for npz_name in npz_files_needed:
+        npz_file_path = folder_path / npz_name
+        if not npz_file_path.exists():
+            return {'status': 'error', 'message': f'必要なアーカイブファイルが存在しません: {npz_name}'}
+        try:
+            with np.load(npz_file_path) as data:
+                if 'images' not in data:
+                    return {'status': 'error', 'message': f'{npz_name} 内に images キーが存在しません'}
+                # 配列をコピーしてメモリに読み込み
+                npz_cache[npz_name] = np.array(data['images'])
+        except Exception as e:
+            return {'status': 'error', 'message': f'{npz_name} の読み込みに失敗しました: {e}'}
 
     total_images = len(index_records)
     if progress_callback:
-        progress_callback(f"解凍処理開始: {folder_path.name} (計{total_images}枚)")
+        progress_callback(f"解凍・展開処理開始: {folder_path.name} (計{total_images}枚)")
 
     # タスクの作成
     tasks = []
     for rec in index_records:
+        npz_name = rec['npz_file']
         idx = rec['index']
-        img_arr = images_array[idx]
+        img_arr = npz_cache[npz_name][idx]
         orig_w = rec['orig_w']
         orig_h = rec['orig_h']
         out_path = folder_path / rec['filename']
@@ -141,17 +151,24 @@ def process_decompress_folder(folder_path, num_workers=4, progress_callback=None
         failed_count = total_images - len(successful_results)
         return {'status': 'error', 'message': f'{failed_count}枚の解凍に失敗したため、アーカイブの削除をスキップします'}
 
-    # 解凍成功後に dataset.npz と images_index.csv を削除
+    # メモリキャッシュのクリア
+    del npz_cache
+
+    # 解凍成功後に関連するすべての npz と csv を削除
     try:
-        os.remove(npz_path)
+        for npz_name in npz_files_needed:
+            p = folder_path / npz_name
+            if p.exists():
+                os.remove(p)
         os.remove(csv_path)
         if progress_callback:
-            progress_callback(f"完了: dataset.npz および images_index.csv を削除しました ({folder_path.name})")
+            progress_callback(f"完了: アーカイブファイルおよび images_index.csv を削除しました ({folder_path.name})")
     except Exception as e:
         if progress_callback:
-            progress_callback(f"警告: 圧縮ファイルの削除中にエラーが発生しました: {e}")
+            progress_callback(f"警告: アーカイブファイルの削除中にエラーが発生しました: {e}")
 
     return {
         'status': 'success',
         'decompressed_count': len(successful_results)
     }
+

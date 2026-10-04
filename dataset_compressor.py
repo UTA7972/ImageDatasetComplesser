@@ -6,7 +6,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from PIL import Image
 
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff', '.tif'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff', '.tif', '.raw', '.ppm', '.pgm', '.pbm', '.pnm'}
+UNCOMPRESSED_EXTENSIONS = {'.bmp', '.tif', '.tiff', '.raw', '.ppm', '.pgm', '.pbm', '.pnm'}
 
 def is_image_file(filepath):
     return Path(filepath).suffix.lower() in IMAGE_EXTENSIONS
@@ -71,13 +72,30 @@ def _process_image_worker(args):
             'filepath': img_path_str
         }
 
+def _save_batch_worker(args):
+    """
+    並列保存用のワーカー関数:
+    指定された画像配列リストを np.savez または np.savez_compressed でファイルへ保存します。
+    """
+    batch_arrays, npz_path_str, is_compressed = args
+    dataset_np_array = np.stack(batch_arrays, axis=0)
+    npz_path = Path(npz_path_str)
+    
+    if is_compressed:
+        np.savez_compressed(npz_path, images=dataset_np_array)
+    else:
+        np.savez(npz_path, images=dataset_np_array)
+        
+    return str(npz_path)
+
 def process_dataset_folder(folder_path, min_images=20, num_workers=4, progress_callback=None):
     """
     単一のデータセットフォルダを処理します。
-    1. 画像一覧の取得
+    1. 画像一覧の取得および非圧縮画像の有無判定
     2. 画像サイズの取得と最大幅・最大の高さの確定
     3. 並列処理で画像読み込み・黒補完
-    4. dataset.npz の保存
+    4. 非圧縮画像がある場合はコア数でタスク分割してマルチコアZip圧縮
+       圧縮済み画像のみの場合は無圧縮パック保存
     5. images_index.csv の保存
     6. 元画像ファイルの削除
     """
@@ -89,6 +107,9 @@ def process_dataset_folder(folder_path, min_images=20, num_workers=4, progress_c
     
     # 昇順で並び替え
     image_paths.sort(key=lambda p: p.name)
+    
+    # 非圧縮画像の有無判定
+    has_uncompressed = any(p.suffix.lower() in UNCOMPRESSED_EXTENSIONS for p in image_paths)
     
     # 全画像の元サイズとアルファチャネルの有無を確認
     meta_info = []
@@ -113,17 +134,18 @@ def process_dataset_folder(folder_path, min_images=20, num_workers=4, progress_c
         return {'status': 'error', 'message': '有効な画像が見つかりませんでした'}
 
     total_images = len(meta_info)
+    num_workers = max(1, min(num_workers, os.cpu_count() or 4))
+    
     if progress_callback:
-        progress_callback(f"データセット処理開始: {folder_path.name} (計{total_images}枚, 最大サイズ: {max_w}x{max_h})")
+        mode_str = f"非圧縮画像あり ({num_workers}コア並列Zip圧縮)" if has_uncompressed else "圧縮済み画像のみ (爆速パック保存)"
+        progress_callback(f"データセット処理開始: {folder_path.name} (計{total_images}枚, 最大サイズ: {max_w}x{max_h}, モード: {mode_str})")
 
     # 並列処理のタスク引数を準備
     tasks = [(p_str, max_w, max_h, has_alpha) for (p_str, _, _) in meta_info]
     
     results = []
     
-    # ProcessPoolExecutor で並列処理
-    num_workers = max(1, min(num_workers, os.cpu_count() or 4))
-    
+    # ProcessPoolExecutor で並列処理（画像読み込み・パディング）
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(_process_image_worker, task) for task in tasks]
         
@@ -133,7 +155,7 @@ def process_dataset_folder(folder_path, min_images=20, num_workers=4, progress_c
             results.append(res)
             completed_count += 1
             if progress_callback and completed_count % 10 == 0:
-                progress_callback(f"  - 画像処理中... {completed_count}/{total_images}")
+                progress_callback(f"  - 画像読み込み・パディング中... {completed_count}/{total_images}")
 
     # 結果をファイル名で元順序にソート
     results.sort(key=lambda x: x['filename'])
@@ -142,21 +164,52 @@ def process_dataset_folder(folder_path, min_images=20, num_workers=4, progress_c
     if not successful_results:
         return {'status': 'error', 'message': 'すべての画像の処理に失敗しました'}
 
-    # NumPy 配列化
-    img_arrays = [r['array'] for r in successful_results]
-    dataset_np_array = np.stack(img_arrays, axis=0)
+    # バッチ分割数（非圧縮画像ありの場合はコア数、無圧縮パックの場合もコア数または1バッチ）
+    num_batches = num_workers if (has_uncompressed and len(successful_results) >= num_workers) else 1
+    chunk_size = (len(successful_results) + num_batches - 1) // num_batches
+    
+    save_tasks = []
+    index_records = []
+    created_npz_files = []
 
-    # npz の保存
-    npz_path = folder_path / "dataset.npz"
-    np.savez_compressed(npz_path, images=dataset_np_array)
+    for batch_idx in range(num_batches):
+        batch_items = successful_results[batch_idx * chunk_size : (batch_idx + 1) * chunk_size]
+        if not batch_items:
+            continue
+        
+        npz_name = "dataset.npz" if num_batches == 1 else f"dataset_part{batch_idx + 1:02d}.npz"
+        npz_path = folder_path / npz_name
+        created_npz_files.append(str(npz_path))
+        
+        batch_arrays = [r['array'] for r in batch_items]
+        save_tasks.append((batch_arrays, str(npz_path), has_uncompressed))
+        
+        for idx_in_batch, r in enumerate(batch_items):
+            index_records.append({
+                'index': idx_in_batch,
+                'filename': r['filename'],
+                'orig_w': r['orig_w'],
+                'orig_h': r['orig_h'],
+                'npz_file': npz_name
+            })
+
+    if progress_callback:
+        action_name = "並列Zip圧縮保存中" if has_uncompressed else "パック保存中"
+        progress_callback(f"  - {action_name}... ({num_batches}ファイルに出力)")
+
+    # 保存処理の実行（マルチコア並列圧縮 or 単一/並列パック）
+    with ProcessPoolExecutor(max_workers=min(len(save_tasks), num_workers)) as executor:
+        save_futures = [executor.submit(_save_batch_worker, task) for task in save_tasks]
+        for future in as_completed(save_futures):
+            future.result()
 
     # images_index.csv の作成
     csv_path = folder_path / "images_index.csv"
     with open(csv_path, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['index', 'filename', 'original_width', 'original_height'])
-        for idx, r in enumerate(successful_results):
-            writer.writerow([idx, r['filename'], r['orig_w'], r['orig_h']])
+        writer.writerow(['index', 'filename', 'original_width', 'original_height', 'npz_file'])
+        for rec in index_records:
+            writer.writerow([rec['index'], rec['filename'], rec['orig_w'], rec['orig_h'], rec['npz_file']])
 
     # 元画像の削除
     deleted_count = 0
@@ -168,12 +221,15 @@ def process_dataset_folder(folder_path, min_images=20, num_workers=4, progress_c
             if progress_callback:
                 progress_callback(f"警告: ファイル削除失敗 {r['filename']}: {e}")
 
+    mode_label = "マルチコアZip圧縮" if has_uncompressed else "パック保存"
     if progress_callback:
-        progress_callback(f"完了: {folder_path.name} -> dataset.npz ({deleted_count}枚の元画像を削除)")
+        progress_callback(f"完了: {folder_path.name} -> {mode_label}完了 ({deleted_count}枚の元画像を削除)")
 
     return {
         'status': 'success',
         'processed_count': len(successful_results),
-        'npz_path': str(npz_path),
-        'csv_path': str(csv_path)
+        'npz_files': created_npz_files,
+        'csv_path': str(csv_path),
+        'mode': 'compressed' if has_uncompressed else 'packed'
     }
+
