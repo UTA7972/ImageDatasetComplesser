@@ -7,7 +7,7 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
 from dataset_compressor import scan_datasets, process_dataset_folder
-from dataset_decompressor import scan_compressed_datasets, process_decompress_folder
+from dataset_decompressor import scan_compressed_datasets, process_decompress_folder, get_compressed_folder_info
 from cloud_sync import (
     scan_and_build_index,
     save_index_csv,
@@ -20,8 +20,8 @@ class DatasetCompressorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Image Dataset Compressor & Cloud Sync Tool")
-        self.root.geometry("860x720")
-        self.root.minsize(760, 620)
+        self.root.geometry("860x740")
+        self.root.minsize(760, 640)
 
         # システム情報
         self.max_cpus = os.cpu_count() or 4
@@ -122,11 +122,15 @@ class DatasetCompressorApp:
         comp_param_frame = ttk.Frame(self.tab_compress)
         comp_param_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(comp_param_frame, text=f"CPUコア数 (最大{self.max_cpus}):").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(comp_param_frame, text=f"CPUコア数 (1~{self.max_cpus}):").pack(side=tk.LEFT, padx=(0, 5))
         self.comp_cpu_var = tk.IntVar(value=self.max_cpus)
-        ttk.Spinbox(comp_param_frame, from_=1, to=self.max_cpus, textvariable=self.comp_cpu_var, width=6).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Spinbox(comp_param_frame, from_=1, to=self.max_cpus, textvariable=self.comp_cpu_var, width=6).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(comp_param_frame, text="データセット判定閾値(枚数):").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(comp_param_frame, text="タスク分割数 (バッチ数):").pack(side=tk.LEFT, padx=(0, 5))
+        self.comp_tasks_var = tk.IntVar(value=max(10, self.max_cpus))
+        ttk.Spinbox(comp_param_frame, from_=1, to=100, textvariable=self.comp_tasks_var, width=6).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(comp_param_frame, text="判定閾値(枚数):").pack(side=tk.LEFT, padx=(0, 5))
         self.min_img_var = tk.IntVar(value=20)
         ttk.Spinbox(comp_param_frame, from_=1, to=1000, textvariable=self.min_img_var, width=6).pack(side=tk.LEFT)
 
@@ -148,13 +152,13 @@ class DatasetCompressorApp:
         decomp_param_frame = ttk.Frame(self.tab_decompress)
         decomp_param_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(decomp_param_frame, text=f"CPUコア数 (最大{self.max_cpus}):").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(decomp_param_frame, text=f"解凍時CPUコア数 (1~{self.max_cpus}):").pack(side=tk.LEFT, padx=(0, 5))
         self.decomp_cpu_var = tk.IntVar(value=self.max_cpus)
         ttk.Spinbox(decomp_param_frame, from_=1, to=self.max_cpus, textvariable=self.decomp_cpu_var, width=6).pack(side=tk.LEFT)
 
         decomp_btn_frame = ttk.Frame(self.tab_decompress)
         decomp_btn_frame.pack(fill=tk.X)
-        self.scan_decomp_btn = ttk.Button(decomp_btn_frame, text="🔍 圧縮データセットスキャン", command=self.start_scan_decompress)
+        self.scan_decomp_btn = ttk.Button(decomp_btn_frame, text="🔍 圧縮データセットスキャン (タスク数取得)", command=self.start_scan_decompress)
         self.scan_decomp_btn.pack(side=tk.LEFT, padx=(0, 10))
         self.start_decomp_btn = ttk.Button(decomp_btn_frame, text="🔓 解凍・復元処理を開始", style="Warn.TButton", command=self.start_processing_decompress)
         self.start_decomp_btn.pack(side=tk.LEFT)
@@ -265,14 +269,16 @@ class DatasetCompressorApp:
             return
 
         num_cpus = self.comp_cpu_var.get()
+        num_tasks = self.comp_tasks_var.get()
         min_imgs = self.min_img_var.get()
 
         confirm = messagebox.askyesno(
             "圧縮処理開始の確認",
-            f"指定されたフォルダ配下のデータセットを npz 圧縮します。\n"
+            f"指定されたフォルダ配下のデータセットを並列処理します。\n"
             f"※ 圧縮後、元の画像ファイルは【削除】されます。\n\n"
             f"・対象フォルダ: {target_path}\n"
-            f"・使用CPUコア数: {num_cpus}\n\n"
+            f"・使用CPUコア数: {num_cpus}\n"
+            f"・タスク分割数: {num_tasks}\n\n"
             f"処理を開始してよろしいですか？"
         )
         if not confirm:
@@ -280,11 +286,11 @@ class DatasetCompressorApp:
 
         self.is_running = True
         self.set_buttons_state(tk.DISABLED)
-        threading.Thread(target=self._process_compress_thread, args=(target_path, num_cpus, min_imgs), daemon=True).start()
+        threading.Thread(target=self._process_compress_thread, args=(target_path, num_cpus, num_tasks, min_imgs), daemon=True).start()
 
-    def _process_compress_thread(self, target_path, num_cpus, min_imgs):
+    def _process_compress_thread(self, target_path, num_cpus, num_tasks, min_imgs):
         self.log("===" * 15, "INFO")
-        self.log("データセット圧縮処理を開始します...", "INFO")
+        self.log(f"データセット並列圧縮パイプラインを開始します... (CPUコア: {num_cpus}, タスク分割: {num_tasks})", "INFO")
         folders = scan_datasets(target_path, min_images=min_imgs)
         total_folders = len(folders)
 
@@ -300,7 +306,13 @@ class DatasetCompressorApp:
             self.root.after(0, lambda p=(idx - 1) / total_folders * 100: self.progress_var.set(p))
             self.root.after(0, lambda text=f"圧縮中 ({idx}/{total_folders}): {folder.name}": self.status_label.config(text=text))
 
-            res = process_dataset_folder(folder, min_images=min_imgs, num_workers=num_cpus, progress_callback=lambda msg: self.log(msg, "INFO"))
+            res = process_dataset_folder(
+                folder, 
+                min_images=min_imgs, 
+                num_workers=num_cpus, 
+                num_tasks=num_tasks, 
+                progress_callback=lambda msg: self.log(msg, "INFO")
+            )
             if res['status'] == 'success':
                 success_count += 1
                 total_deleted_images += res['processed_count']
@@ -328,8 +340,11 @@ class DatasetCompressorApp:
         self.log(f"解凍対象スキャン開始: {target_path}", "INFO")
         folders = scan_compressed_datasets(target_path)
         self.log(f"スキャン完了. 圧縮データセットフォルダ数: {len(folders)} 件", "SUCCESS")
+        
         for idx, f in enumerate(folders, 1):
-            self.log(f"  [{idx}] {f}", "INFO")
+            info = get_compressed_folder_info(f)
+            self.log(f"  [{idx}] {info['folder_name']} (アーカイブ数: {info['task_count']} 個, 総画像枚数: {info['total_images']} 枚)", "INFO")
+            
         self.root.after(0, lambda: self._on_scan_complete(self.scan_decomp_btn, f"スキャン完了: {len(folders)} 件の圧縮データセット検出"))
 
     def start_processing_decompress(self):
@@ -344,10 +359,10 @@ class DatasetCompressorApp:
 
         confirm = messagebox.askyesno(
             "解凍・復元処理開始の確認",
-            f"指定されたフォルダ配下の dataset.npz を解凍・画像復元します。\n"
-            f"※ 復元完了後、dataset.npz と images_index.csv は【削除】されます。\n\n"
+            f"指定されたフォルダ配下のアーカイブを並列展開・復元します。\n"
+            f"※ 復元完了後、アーカイブファイルと images_index.csv は【削除】されます。\n\n"
             f"・対象フォルダ: {target_path}\n"
-            f"・使用CPUコア数: {num_cpus}\n\n"
+            f"・解凍時CPUコア数: {num_cpus}\n\n"
             f"処理を開始してよろしいですか？"
         )
         if not confirm:
@@ -359,7 +374,7 @@ class DatasetCompressorApp:
 
     def _process_decompress_thread(self, target_path, num_cpus):
         self.log("===" * 15, "INFO")
-        self.log("データセット解凍・復元処理を開始します...", "INFO")
+        self.log(f"データセット解凍・復元処理を開始します... (使用CPUコア数: {num_cpus})", "INFO")
         folders = scan_compressed_datasets(target_path)
         total_folders = len(folders)
 
@@ -387,6 +402,9 @@ class DatasetCompressorApp:
         self.log("===" * 15, "SUCCESS")
         self.log(f"全解凍・復元処理が完了しました！ (成功: {success_count}/{total_folders} フォルダ, 復元画像: {total_restored_images} 枚)", "SUCCESS")
         self.root.after(0, self._on_process_complete)
+
+    # --- クラウド転送・同期処理 ---
+
 
     # --- クラウド転送・同期処理 ---
     def start_scan_cloud(self):

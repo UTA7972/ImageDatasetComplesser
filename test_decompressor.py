@@ -43,7 +43,7 @@ def main():
     print("\n--- 2. 圧縮テスト ---")
     comp_res = process_dataset_folder(test_root, min_images=20, num_workers=2, progress_callback=print)
     assert comp_res['status'] == 'success', f"圧縮失敗: {comp_res}"
-    assert (test_root / "dataset.npz").exists()
+    assert len(list(test_root.glob("*.npz"))) > 0
     assert (test_root / "images_index.csv").exists()
     assert len(list(test_root.glob("*.png"))) == 0, "元画像が削除されていません"
 
@@ -58,7 +58,7 @@ def main():
 
     print("\n--- 5. 復元検証 ---")
     # npz と csv が削除されているか
-    assert not (test_root / "dataset.npz").exists(), "dataset.npz が削除されていません"
+    assert len(list(test_root.glob("*.npz"))) == 0, "npz アーカイブが削除されていません"
     assert not (test_root / "images_index.csv").exists(), "images_index.csv が削除されていません"
 
     # 復元された画像の検証

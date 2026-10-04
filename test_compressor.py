@@ -46,9 +46,9 @@ def main():
         print("結果:", res)
         
         # 検証
-        npz_file = f / "dataset.npz"
+        npz_files = list(f.glob("*.npz"))
         csv_file = f / "images_index.csv"
-        assert npz_file.exists(), "dataset.npz が作成されていません"
+        assert len(npz_files) > 0, ".npz ファイルが作成されていません"
         assert csv_file.exists(), "images_index.csv が作成されていません"
         
         # 元画像が削除されているか検証
@@ -56,9 +56,9 @@ def main():
         assert len(png_files) == 0, f"元画像が削除されていません: {len(png_files)}件残存"
         
         # npzデータの検証
-        with np.load(npz_file) as data:
+        with np.load(npz_files[0]) as data:
             imgs = data['images']
-            print(f"  -> npz内の画像配列形状: {imgs.shape}")
+            print(f"  -> npz内の画像配列形状 ({npz_files[0].name}): {imgs.shape}")
         
     print("\nすべてのテストが成功しました！")
 
